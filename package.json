@@ -1,0 +1,15 @@
+{
+  "name": "cloud-run-firestore-backend",
+  "version": "1.0.0",
+  "description": "Node.js Express backend for Google Cloud Run with Cloud Firestore.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.1.0",
+    "uuid": "^9.0.1"
+  }
+}
