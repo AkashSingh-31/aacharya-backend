@@ -2,6 +2,7 @@
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const cors = require("cors");
+const { fetchEnrolledClassesWithParents } = require("./helper");
 
 /**
  * Creates and configures the Express application with all routes and middleware.
@@ -255,57 +256,43 @@ function createApp(db, admin) {
     try {
       const userId = req.userId;
 
-      const userDoc = await usersCollection.doc(userId).get();
-
-      if (!userDoc.exists) {
-        return res.status(404).json({ error: "User profile not found." });
-      }
-
-      const userData = userDoc.data();
-      const classIds = Array.isArray(userData.enrolled_classes)
-        ? userData.enrolled_classes
-        : [];
-
-      const schoolId = userData.school_id;
-
-      if (classIds.length === 0) {
-        return res.status(200).json({
-          message: "User is not currently enrolled in any classes.",
-          classes: [],
-        });
-      }
-
-      const classPromises = classIds.map((classId) =>
-        db
-          .collection("school")
-          .doc(schoolId)
-          .collection("class")
-          .doc(classId)
-          .get()
+      const subjectsWithClasses = await fetchEnrolledClassesWithParents(
+        db,
+        usersCollection,
+        userId
       );
 
-      const classSnapshots = await Promise.all(classPromises);
-      const classes = [];
+      if (subjectsWithClasses.length === 0) {
+        const userDoc = await usersCollection.doc(userId).get();
+        const userData = userDoc.data();
+        const enrolledRefs = Array.isArray(userData.enrolled_classes)
+          ? userData.enrolled_classes
+          : [];
 
-      classSnapshots.forEach((classDoc) => {
-        if (classDoc.exists) {
-          classes.push({
-            id: classDoc.id,
-            ...classDoc.data(),
+        if (enrolledRefs.length === 0) {
+          return res.status(200).json({
+            message: "User is not currently enrolled in any subjects.",
+            subjects: [],
           });
         } else {
-          console.warn(
-            `Class document not found for ID: ${classDoc.id} in school: ${schoolId}`
-          );
+          return res.status(200).json({
+            message:
+              "User is enrolled, but no valid subject data was retrieved.",
+            subjects: [],
+          });
         }
-      });
+      }
 
-      // Return the aggregated list of classes
       res.json({
-        message: `Successfully retrieved ${classes.length} enrolled class(es).`,
-        classes: classes,
+        message: `Successfully retrieved ${subjectsWithClasses.length} enrolled subject(s) with parent class data.`,
+        subjects: subjectsWithClasses,
       });
     } catch (error) {
+      // Check for specific error thrown by the helper
+      if (error.message === "User profile not found.") {
+        return res.status(404).json({ error: error.message });
+      }
+
       console.error("API /api/classes error:", error.message, error.stack);
       res.status(500).json({
         error: "An unexpected server error occurred while fetching class data.",
@@ -320,7 +307,7 @@ function createApp(db, admin) {
    */
   app.get("/user-role-config", authenticateToken, async (req, res) => {
     try {
-      const userRole = req.user.user_type;
+      const userRole = req.user.user_role;
 
       if (!userRole) {
         return res.status(404).json({
@@ -350,6 +337,151 @@ function createApp(db, admin) {
       res.status(500).json({
         error:
           "An unexpected server error occurred while fetching role configuration.",
+      });
+    }
+  });
+
+  /**
+   * POST /timetable
+   * Inserts or edits the entire timetable document for a specific class.
+   * The target path is: school/{school_id}/classes/{class_id}/timetable/current_schedule
+   * Requires authentication.
+   */
+  app.post("/timetable", authenticateToken, async (req, res) => {
+    try {
+      const userId = req.userId;
+      const userRole = req.user.user_role;
+
+      // Authorization Check: Only administrators and teachers can update the timetable
+      if (userRole !== "admin" && userRole !== "teacher") {
+        return res.status(403).json({
+          error:
+            "Forbidden: Only administrators and teachers can update the timetable.",
+        });
+      }
+      // The class_id is needed to form the path, and weekdays is the data to be saved.
+      const { class_id, weekdays } = req.body;
+      // Assuming the authenticated user object has the school_id field
+      const schoolId = req.user.school_id;
+
+      // 1. Input Validation
+      if (
+        !class_id ||
+        !weekdays ||
+        typeof weekdays !== "object" ||
+        Array.isArray(weekdays)
+      ) {
+        return res.status(400).json({
+          error:
+            "Missing or invalid data: class_id and weekdays object are required in the request body.",
+        });
+      }
+      if (!schoolId) {
+        return res.status(400).json({
+          error:
+            "School ID missing from authenticated user profile. Cannot determine timetable location.",
+        });
+      }
+
+      // 2. Define the target Firestore path (DocumentReference)
+      // We use 'current_schedule' as a fixed document ID within the 'timetable' collection
+      const timetableDocRef = db
+        .collection("school")
+        .doc(schoolId)
+        .collection("classes")
+        .doc(class_id)
+        .collection("timetable")
+        .doc("current_schedule");
+
+      const timetableData = {
+        weekdays: weekdays,
+        updatedBy: userId,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      // 3. Upsert (Insert or Edit) the document
+      // Using set() will overwrite the existing document or create a new one.
+      await timetableDocRef.set(timetableData);
+
+      res.json({
+        message: `Timetable successfully updated for class ${class_id} in school ${schoolId}.`,
+        timetablePath: timetableDocRef.path,
+      });
+    } catch (error) {
+      console.error("API /api/timetable error:", error.message, error.stack);
+      res.status(500).json({
+        error:
+          "An unexpected server error occurred while processing the timetable request.",
+      });
+    }
+  });
+
+  /**
+   * GET /timetable
+   * Retrieves the current timetable document for a specific class.
+   * Path: school/{school_id}/classes/{class_id}/timetable/current_schedule
+   * Requires authentication. class_id is passed as a query parameter.
+   */
+  app.get("/timetable", authenticateToken, async (req, res) => {
+    try {
+      // class_id is expected as a query parameter: /api/timetable?class_id=ClassA
+      const classId = req.query.class_id;
+      // school_id is derived from the authenticated user
+      const schoolId = req.user.school_id;
+
+      // 1. Input Validation
+      if (!classId) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Missing parameter: class_id is required as a query parameter.",
+          });
+      }
+      if (!schoolId) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "School ID missing from authenticated user profile. Cannot determine timetable location.",
+          });
+      }
+
+      // 2. Define the target Firestore path (DocumentReference)
+      const timetableDocRef = db
+        .collection("school")
+        .doc(schoolId)
+        .collection("classes")
+        .doc(classId)
+        .collection("timetable")
+        .doc("current_schedule");
+
+      // 3. Retrieve the document
+      const docSnap = await timetableDocRef.get();
+
+      if (!docSnap.exists) {
+        return res.status(404).json({
+          message: `Timetable not found for class ${classId}.`,
+          timetablePath: timetableDocRef.path,
+          weekdays: {}, // Return an empty object for consistency
+        });
+      }
+
+      // 4. Return the timetable data
+      res.json({
+        message: `Timetable successfully retrieved for class ${classId}.`,
+        timetablePath: timetableDocRef.path,
+        ...docSnap.data(),
+      });
+    } catch (error) {
+      console.error(
+        "API /api/timetable (GET) error:",
+        error.message,
+        error.stack
+      );
+      res.status(500).json({
+        error:
+          "An unexpected server error occurred while retrieving the timetable.",
       });
     }
   });
